@@ -1,0 +1,84 @@
+/* Кнопки и панели — fixed относительно viewport, не зависят от родителя.
+   width/height 100% + inset:0 в Chrome ведут себя стабильнее, чем 100vw/100vh (нет полосы прокрутки). */
+.z96a-ui-layer {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  max-width: 100% !important;
+  max-height: 100% !important;
+  z-index: 2147483647 !important;
+  pointer-events: none !important;
+  opacity: 1 !important;
+  display: block !important;
+  overflow: hidden !important;
+}
+
+/* Скрытый слой: только видимость и клики отключаем через data-атрибут + инлайн */
+.z96a-ui-layer[data-hidden="true"] {
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+.z96a-ui-layer * {
+  pointer-events: auto !important;
+  visibility: visible !important;
+  box-sizing: border-box;
+}
+
+#z96a-ui-root .z96a-ui-layer {
+  overflow: visible !important;
+}
+
+.z96a-panel {
+  background: #1e293b !important;
+  color: #fff !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+}
+
+/* Панель навигации на глобусе — полупрозрачный фон (чтобы кнопки были видны), не сжимать */
+.z96a-panel.z96a-globe-nav {
+  background: rgba(30, 41, 59, 0.92) !important;
+  box-shadow: none !important;
+  min-width: min-content !important;
+  overflow: visible !important;
+}
+
+/* Убрать кольцо фокуса (серый кружок) у кнопок навигации */
+.z96a-panel button {
+  outline: none !important;
+}
+.z96a-panel button:focus-visible {
+  outline: none !important;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.5) !important;
+}
+
+/* Корень портала с кнопками — всегда видим, не обрезать контент, свой контекст наложения */
+#z96a-ui-root,
+[data-z96a-ui="root"] {
+  visibility: visible !important;
+  display: block !important;
+  opacity: 1 !important;
+  overflow: visible !important;
+  isolation: isolate !important;
+}
+
+/* Панели и кнопки — видимы и кликабельны; слой .z96a-ui-layer НЕ трогаем (должен оставаться pointer-events: none, чтобы ЛКМ шла на глобус) */
+[data-z96a-ui="root"] .z96a-panel,
+[data-z96a-ui="root"] button,
+[data-z96a-ui="root"] input {
+  visibility: visible !important;
+  opacity: 1 !important;
+  pointer-events: auto !important;
+}
+
+/* Скрыть стандартные элементы Leaflet (серый атрибут/контролы/кружок масштаба) */
+.leaflet-control-attribution,
+.leaflet-control-zoom,
+.leaflet-control-container {
+  display: none !important;
+}

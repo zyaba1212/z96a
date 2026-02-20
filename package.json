@@ -1,0 +1,41 @@
+{
+  "name": "z96a",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "postinstall": "prisma generate"
+  },
+  "dependencies": {
+    "@react-three/drei": "^9.122.0",
+    "@react-three/fiber": "^8.17.0",
+    "@solana/wallet-adapter-base": "^0.9.27",
+    "@solana/wallet-adapter-phantom": "^0.9.27",
+    "@solana/wallet-adapter-react": "^0.15.39",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "leaflet": "^1.9.4",
+    "next": "15.0.3",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "three": "^0.170.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@prisma/client": "^6.19.2",
+    "@tailwindcss/postcss": "^4.2.0",
+    "@types/leaflet": "^1.9.21",
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "eslint": "^9.39.2",
+    "eslint-config-next": "15.0.3",
+    "postcss": "^8.5.6",
+    "prisma": "^6.19.2",
+    "tailwindcss": "^4.2.0",
+    "typescript": "^5.9.3"
+  }
+}
