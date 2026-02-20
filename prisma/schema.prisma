@@ -1,4 +1,4 @@
-// Этап 0: каркас. Этап 1: User по pubkey.
+// Этап 0: каркас. Этап 1: User по pubkey. Этап 4: сеть (глобальная/локальная).
 generator client {
   provider = "prisma-client-js"
 }
@@ -13,4 +13,30 @@ model User {
   pubkey    String   @unique
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+// Провайдер: глобальный (на глобусе) или локальный (на 2D-карте). Источник данных — официальный.
+model NetworkProvider {
+  id        String   @id @default(cuid())
+  name      String
+  scope     String   // "GLOBAL" | "LOCAL"
+  sourceUrl String?  // официальный источник
+  elements  NetworkElement[]
+}
+
+// Типы: CABLE_COPPER, CABLE_FIBER, BASE_STATION, SATELLITE, EQUIPMENT. scope: GLOBAL (глобус + 2D) или LOCAL (только 2D).
+model NetworkElement {
+  id          String          @id @default(cuid())
+  scope       String          // "GLOBAL" | "LOCAL"
+  type        String          // CABLE_COPPER | CABLE_FIBER | BASE_STATION | SATELLITE | EQUIPMENT
+  providerId  String?
+  provider    NetworkProvider? @relation(fields: [providerId], references: [id])
+  name        String?
+  // Точка (БС, спутник, оборудование): lat/lng заданы, path пустой.
+  lat         Float?
+  lng         Float?
+  // Кабель: массив точек [{lat, lng}, ...] в JSON.
+  path        Json?           // [{ "lat": number, "lng": number }, ...]
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
 }

@@ -93,7 +93,6 @@ function raDecToXYZ(raHours: number, decDeg: number, radius: number): [number, n
 }
 
 /** Добавляет в сцену звёздное небо: яркие звёзды из BRIGHT_STARS + случайные точки с мерцанием (shader) */
-/** Добавляет в сцену звёздное небо: яркие звёзды из BRIGHT_STARS + случайные точки с мерцанием (shader) */
 function addStarfield(scene: THREE.Scene, timeRef: { current: number }) {
   const positions: number[] = [];
   const phases: number[] = [];
@@ -222,6 +221,56 @@ function addBorders(scene: THREE.Scene) {
       }
     )
     .catch(() => {});
+}
+
+/** Цвета кабелей по design.md: медь — оранжевый, оптика — зелёный */
+const CABLE_COPPER_COLOR = 0xe67e22;
+const CABLE_FIBER_COLOR = 0x22c55e;
+const NODE_COLOR = 0x3498db;
+
+/** Типы элементов сети из API */
+type NetworkElementApi = {
+  id: string;
+  scope: string;
+  type: string;
+  name: string | null;
+  lat: number | null;
+  lng: number | null;
+  path: Array<{ lat: number; lng: number }> | null;
+};
+
+/** Загружает /api/network?scope=GLOBAL и отрисовывает кабели (линии) и узлы (малые сферы) на глобусе. */
+function addNetworkLayer(scene: THREE.Scene) {
+  const group = new THREE.Group();
+  group.name = "network";
+  fetch("/api/network?scope=GLOBAL")
+    .then((r) => r.json())
+    .then((data: { elements?: NetworkElementApi[] }) => {
+      const elements = data.elements ?? [];
+      elements.forEach((el) => {
+        if (el.path && Array.isArray(el.path) && el.path.length >= 2) {
+          const color =
+            el.type === "CABLE_FIBER" ? CABLE_FIBER_COLOR : CABLE_COPPER_COLOR;
+          const pts = el.path.map((p) => new THREE.Vector3(...latLngToXYZ(p.lat, p.lng)));
+          const line = new THREE.Line(
+            new THREE.BufferGeometry().setFromPoints(pts),
+            new THREE.LineBasicMaterial({ color, linewidth: 1 })
+          );
+          group.add(line);
+        } else if (el.lat != null && el.lng != null) {
+          const [x, y, z] = latLngToXYZ(el.lat, el.lng);
+          const mesh = new THREE.Mesh(
+            new THREE.SphereGeometry(0.012, 8, 6),
+            new THREE.MeshBasicMaterial({ color: NODE_COLOR })
+          );
+          mesh.position.set(x, y, z);
+          group.add(mesh);
+        }
+      });
+      scene.add(group);
+    })
+    .catch(() => {});
+  return group;
 }
 
 type LabelEntry = { pos: THREE.Vector3; el: HTMLDivElement };
@@ -549,6 +598,7 @@ export default function EarthScene({
         );
         scene.add(earth);
         addBorders(scene);
+        addNetworkLayer(scene);
         requestAnimationFrame(() => {
           addLabels(labelsContainerRef.current, labelsRef);
         });
@@ -563,6 +613,7 @@ export default function EarthScene({
           )
         );
         addBorders(scene);
+        addNetworkLayer(scene);
         requestAnimationFrame(() => {
           addLabels(labelsContainerRef.current, labelsRef);
         });
@@ -669,6 +720,17 @@ export default function EarthScene({
       cancelAnimationFrame(id);
       mapInstanceRef.current?.remove();
       controls.dispose();
+      scene.traverse((obj) => {
+        if (obj.name === "network" && obj instanceof THREE.Group) {
+          obj.children.forEach((c) => {
+            if (c instanceof THREE.Line && c.geometry) c.geometry.dispose();
+            if (c instanceof THREE.Mesh) {
+              c.geometry?.dispose();
+              if (c.material) (Array.isArray(c.material) ? c.material : [c.material]).forEach((m) => m.dispose());
+            }
+          });
+        }
+      });
       starfield.points.geometry.dispose();
       (starfield.points.material as THREE.Material).dispose();
       renderer.dispose();
@@ -741,6 +803,29 @@ export default function EarthScene({
         } catch (_) {
           setLocationText("Адрес не определён");
         }
+        // Сеть на 2D: глобальные кабели/узлы + локальные элементы (design.md: медь — оранжевый, оптика — зелёный)
+        fetch("/api/network")
+          .then((r) => r.json())
+          .then((data: { elements?: NetworkElementApi[] }) => {
+            if (mapInstanceRef.current !== map || cancelled) return;
+            const elements = data.elements ?? [];
+            elements.forEach((el) => {
+              if (el.path && Array.isArray(el.path) && el.path.length >= 2) {
+                const latlngs = el.path.map((p) => [p.lat, p.lng] as [number, number]);
+                const color = el.type === "CABLE_FIBER" ? "#22c55e" : "#e67e22";
+                L.polyline(latlngs, { color, weight: 3 }).addTo(map);
+              } else if (el.lat != null && el.lng != null) {
+                L.circleMarker([el.lat, el.lng], {
+                  radius: 6,
+                  fillColor: "#3498db",
+                  color: "#fff",
+                  weight: 1,
+                  fillOpacity: 0.9,
+                }).addTo(map);
+              }
+            });
+          })
+          .catch(() => {});
       });
     });
     return () => {
