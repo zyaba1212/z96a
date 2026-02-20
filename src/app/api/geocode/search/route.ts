@@ -1,3 +1,7 @@
+/**
+ * Поиск по адресу/месту: GET /api/geocode/search?q=
+ * Прокси к Nominatim Search, возвращает массив результатов (limit 10).
+ */
 import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -9,7 +13,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "q required" }, { status: 400 });
   }
   try {
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=5`;
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=10`;
     const res = await fetch(url, { headers: { "User-Agent": "z96a/1.0" } });
     const data = await res.json();
     return NextResponse.json(Array.isArray(data) ? data : []);

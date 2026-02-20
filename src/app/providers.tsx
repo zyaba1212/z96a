@@ -1,5 +1,9 @@
 "use client";
 
+/**
+ * Провайдеры приложения: Solana RPC и кошелёк (Phantom).
+ * RPC берётся из NEXT_PUBLIC_SOLANA_RPC или devnet по умолчанию.
+ */
 import { useMemo } from "react";
 import { ConnectionProvider, WalletProvider } from "@solana/wallet-adapter-react";
 import { PhantomWalletAdapter } from "@solana/wallet-adapter-phantom";

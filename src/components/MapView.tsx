@@ -1,5 +1,9 @@
 "use client";
 
+/**
+ * Отдельный вид 2D-карты (Leaflet): поиск, геолокация, стрелки для панорамирования.
+ * Используется как альтернативный экран; кнопка «Глобус» возвращает на главную.
+ */
 import "leaflet/dist/leaflet.css";
 import { useRef, useEffect, useState } from "react";
 

@@ -1,3 +1,7 @@
+/**
+ * Авторизация по подписи Solana: POST с pubkey, message, signature (base58).
+ * Проверка через nacl.sign.detached.verify; при успехе — upsert пользователя в БД.
+ */
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import nacl from "tweetnacl";

@@ -1,3 +1,7 @@
+/**
+ * Обратный геокодинг: GET /api/geocode/reverse?lat=&lng=
+ * Возвращает данные Nominatim (display_name и др.) по координатам.
+ */
 import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";

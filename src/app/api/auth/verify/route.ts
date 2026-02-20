@@ -1,3 +1,7 @@
+/**
+ * Верификация входа по подписи Solana: POST с publicKey, message, signature.
+ * Используется фронтом (AuthBlock) после signMessage; при успехе — upsert в БД.
+ */
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import nacl from "tweetnacl";

@@ -1,5 +1,9 @@
 "use client";
 
+/**
+ * Блок авторизации: подключение Phantom, подпись сообщения, вызов /api/auth/verify.
+ * После успешного входа — короткий адрес кошелька, ссылка «Предложить», кнопка «Выйти».
+ */
 import { useState } from "react";
 import { useWallet } from "@solana/wallet-adapter-react";
 import bs58 from "bs58";

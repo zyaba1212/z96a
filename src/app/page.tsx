@@ -1,5 +1,9 @@
 "use client";
 
+/**
+ * Главная страница приложения.
+ * HomePage подгружается динамически без SSR (Three.js/WebGL и Leaflet требуют window).
+ */
 import dynamic from "next/dynamic";
 
 const HomePage = dynamic(() => import("@/components/HomePage"), {

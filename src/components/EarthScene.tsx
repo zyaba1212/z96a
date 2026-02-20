@@ -1,12 +1,21 @@
 "use client";
 
+/**
+ * Сцена глобуса (Three.js) и 2D-карты (Leaflet overlay).
+ * Глобус: текстура Земли, границы, звёзды, подписи стран; переход в 2D при приближении или по кнопке «На карту».
+ * 2D: тайлы через /api/tile, поиск по адресу, обратный геокод, возврат на глобус по кнопке или при отдалении.
+ */
 import { useRef, useEffect, useState, useCallback } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import "leaflet/dist/leaflet.css";
 
+/** Радиус сферы Земли в сцене */
 const R = 1;
 const MAP_THRESHOLD = 1.25;
+/** Гистерезис: переход глобус→2D только при минимальном расстоянии (зум колёсиком не сбрасывает кнопки) */
+const MAP_THRESHOLD_ENTER_2D = 1.2;
+/** Минимальный зум Leaflet, ниже которого выполняется возврат на глобус */
 const MIN_ZOOM_GLOBE = 11;
 const STAR_RADIUS = 250;
 const TEXTURE_URL =
@@ -73,6 +82,7 @@ const BRIGHT_STARS: [number, number, number][] = [
   [17.62, -26.43, 2.75],  // Антарес B
 ];
 
+/** Преобразование экваториальных координат (RA в часах, Dec в градусах) в декартовы x,y,z на сфере радиуса radius */
 function raDecToXYZ(raHours: number, decDeg: number, radius: number): [number, number, number] {
   const ra = (raHours * 15 * Math.PI) / 180;
   const dec = (decDeg * Math.PI) / 180;
@@ -82,6 +92,8 @@ function raDecToXYZ(raHours: number, decDeg: number, radius: number): [number, n
   return [x, y, z];
 }
 
+/** Добавляет в сцену звёздное небо: яркие звёзды из BRIGHT_STARS + случайные точки с мерцанием (shader) */
+/** Добавляет в сцену звёздное небо: яркие звёзды из BRIGHT_STARS + случайные точки с мерцанием (shader) */
 function addStarfield(scene: THREE.Scene, timeRef: { current: number }) {
   const positions: number[] = [];
   const phases: number[] = [];
@@ -135,6 +147,7 @@ function addStarfield(scene: THREE.Scene, timeRef: { current: number }) {
   return { points, material };
 }
 
+/** Широта/долгота → координаты на сфере единичного радиуса (для границ и подписей) */
 function latLngToXYZ(lat: number, lng: number): [number, number, number] {
   const phi = ((90 - lat) * Math.PI) / 180;
   const theta = (lng * Math.PI) / 180;
@@ -145,6 +158,7 @@ function latLngToXYZ(lat: number, lng: number): [number, number, number] {
   ];
 }
 
+/** Декартовы x,y,z на сфере → широта и долгота */
 function xyzToLatLon(x: number, y: number, z: number): { lat: number; lon: number } {
   const phi = Math.acos(Math.max(-1, Math.min(1, y / R)));
   const lat = 90 - (phi * 180) / Math.PI;
@@ -152,6 +166,7 @@ function xyzToLatLon(x: number, y: number, z: number): { lat: number; lon: numbe
   return { lat, lon };
 }
 
+/** Пересечение луча с сферой; возвращает ближайшую точку пересечения или null */
 function raySphereIntersection(
   origin: THREE.Vector3,
   dir: THREE.Vector3,
@@ -169,6 +184,7 @@ function raySphereIntersection(
   return origin.clone().add(dir.multiplyScalar(t));
 }
 
+/** Асинхронно загружает GeoJSON границ стран и рисует их линиями на глобусе */
 function addBorders(scene: THREE.Scene) {
   fetch(BORDERS_URL)
     .then((r) => r.json())
@@ -210,6 +226,7 @@ function addBorders(scene: THREE.Scene) {
 
 type LabelEntry = { pos: THREE.Vector3; el: HTMLDivElement };
 
+/** Загружает границы, по центру каждого полигона создаёт DOM-подпись (название страны), синхронизирует позиции в animate */
 function addLabels(
   labelsContainer: HTMLDivElement | null,
   labelsDataRef: { current: LabelEntry[] }
@@ -273,6 +290,7 @@ function addLabels(
     .catch(() => {});
 }
 
+/** API управления глобусом снаружи (зум +/−, панорамирование) */
 export type GlobeControls = {
   zoomIn: () => void;
   zoomOut: () => void;
@@ -307,18 +325,33 @@ export default function EarthScene({
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const mapInstanceRef = useRef<ReturnType<typeof import("leaflet").map> | null>(null);
   const overlayShownRef = useRef(false);
+  const transitionTo2DRef = useRef<(() => void) | null>(null);
+  const lastDistOver6Ref = useRef(false);
+  const setShowGoToMapButtonRef = useRef<((v: boolean) => void) | null>(null);
 
   const [showMapOverlay, setShowMapOverlay] = useState(false);
+  const [showGoToMapButton, setShowGoToMapButton] = useState(false);
   const [mapCenter, setMapCenter] = useState<MapCenter | null>(null);
   const [locationText, setLocationText] = useState<string>("Загрузка…");
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchResult, setSearchResult] = useState<string | null>(null);
+  type SearchResultItem = { lat: number; lon: number; display_name: string };
+  const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
+  const [searchResultPage, setSearchResultPage] = useState(0);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [mapZoom, setMapZoom] = useState(12);
+  const [pressedKeys, setPressedKeys] = useState({ up: false, down: false, left: false, right: false });
   const keysRef = useRef({ up: false, down: false, left: false, right: false });
   const PAN_STEP = 80;
   useEffect(() => {
     autoRotateRef.current = autoRotate;
   }, [autoRotate]);
+
+  useEffect(() => {
+    setShowGoToMapButtonRef.current = setShowGoToMapButton;
+    return () => {
+      setShowGoToMapButtonRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     onMapOverlayChange?.(showMapOverlay);
@@ -373,10 +406,15 @@ export default function EarthScene({
     } catch (_) {}
     mapInstanceRef.current = null;
     overlayShownRef.current = false;
-    setShowMapOverlay(false);
-    setMapCenter(null);
+    lastDistOver6Ref.current = false;
+    setShowGoToMapButton(false);
+    requestAnimationFrame(() => {
+      setShowMapOverlay(false);
+      setMapCenter(null);
+    });
   }, []);
 
+  /** Инициализация Three.js: сцена, камера, рендерер, OrbitControls, Земля, границы, подписи, звёзды; цикл animate и переход в 2D при приближении */
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -385,7 +423,8 @@ export default function EarthScene({
     scene.background = new THREE.Color(0x000814);
     const w = container.clientWidth;
     const h = container.clientHeight;
-    const camera = new THREE.PerspectiveCamera(50, w / h, 0.1, 1000);
+    const aspect = w > 0 && h > 0 ? w / h : 1;
+    const camera = new THREE.PerspectiveCamera(50, aspect, 0.1, 1000);
     camera.position.set(0, 0, 7);
     camera.lookAt(0, 0, 0);
     camera.updateProjectionMatrix();
@@ -394,13 +433,14 @@ export default function EarthScene({
     const starfield = addStarfield(scene, timeRef);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setSize(w, h);
+    renderer.setSize(Math.max(1, w), Math.max(1, h));
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.domElement.style.display = "block";
     renderer.domElement.style.width = "100%";
     renderer.domElement.style.height = "100%";
     renderer.domElement.style.position = "relative";
     renderer.domElement.style.zIndex = "0";
+    renderer.domElement.style.pointerEvents = "auto";
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -459,6 +499,29 @@ export default function EarthScene({
     };
     apiRef.current = api;
     onControlsReady?.(api);
+
+    transitionTo2DRef.current = () => {
+      const ctrl = controlsRef.current;
+      const cam = cameraRef.current;
+      if (!ctrl || !cam) return;
+      const dist = cam.position.distanceTo(ctrl.target);
+      if (dist > 1.2) {
+        const dir = cam.position.clone().sub(ctrl.target).normalize();
+        cam.position.copy(ctrl.target).add(dir.multiplyScalar(1.15));
+      }
+      const rayDir = ctrl.target.clone().sub(cam.position).normalize();
+      const hit = raySphereIntersection(
+        cam.position.clone(),
+        rayDir,
+        new THREE.Vector3(0, 0, 0),
+        R
+      );
+      const point = hit || ctrl.target.clone().normalize();
+      const { lat, lon } = xyzToLatLon(point.x, point.y, point.z);
+      overlayShownRef.current = true;
+      setMapCenter({ lat, lon });
+      setShowMapOverlay(true);
+    };
 
     scene.add(new THREE.AmbientLight(0xffffff, 1.6));
     const dir = new THREE.DirectionalLight(0xffffff, 2.4);
@@ -519,6 +582,11 @@ export default function EarthScene({
     window.addEventListener("resize", onResize);
     onResize();
 
+    const resizeObserver = new ResizeObserver(() => {
+      onResize();
+    });
+    resizeObserver.observe(container);
+
     let id: number;
     const animate = () => {
       id = requestAnimationFrame(animate);
@@ -527,7 +595,14 @@ export default function EarthScene({
         ctrl.autoRotate = autoRotateRef.current;
         ctrl.update();
         const dist = camera.position.distanceTo(ctrl.target);
-        if (dist < MAP_THRESHOLD && !overlayShownRef.current) {
+        if (!overlayShownRef.current) {
+          const over6 = dist >= 6;
+          if (over6 !== lastDistOver6Ref.current) {
+            lastDistOver6Ref.current = over6;
+            setShowGoToMapButtonRef.current?.(over6);
+          }
+        }
+        if (dist <= MAP_THRESHOLD_ENTER_2D && !overlayShownRef.current) {
           const origin = camera.position.clone();
           const rayDir = ctrl.target
             .clone()
@@ -541,9 +616,13 @@ export default function EarthScene({
           );
           const point = hit || ctrl.target.clone().normalize();
           const { lat, lon } = xyzToLatLon(point.x, point.y, point.z);
-          overlayShownRef.current = true;
-          setMapCenter({ lat, lon });
-          setShowMapOverlay(true);
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              overlayShownRef.current = true;
+              setMapCenter({ lat, lon });
+              setShowMapOverlay(true);
+            });
+          });
         }
       }
       timeRef.current += 0.016;
@@ -584,6 +663,8 @@ export default function EarthScene({
     animate();
 
     return () => {
+      transitionTo2DRef.current = null;
+      resizeObserver.disconnect();
       window.removeEventListener("resize", onResize);
       cancelAnimationFrame(id);
       mapInstanceRef.current?.remove();
@@ -601,15 +682,27 @@ export default function EarthScene({
     };
   }, [onReady, onControlsReady]);
 
+  /** При включённом 2D: динамический импорт Leaflet, создание карты с тайлами /api/tile, reverse geocode при moveend, возврат на глобус при zoom < MIN_ZOOM_GLOBE */
   useEffect(() => {
     if (!showMapOverlay || !mapCenter) return;
     const overlay = overlayRef.current;
     if (!overlay || typeof window === "undefined") return;
+    let cancelled = false;
     let L: typeof import("leaflet");
     import("leaflet").then((leaflet) => {
+      if (cancelled) return;
       L = leaflet.default;
       requestAnimationFrame(() => {
+        if (cancelled) return;
         if (!overlay) return;
+        const existing = mapInstanceRef.current;
+        if (existing) {
+          try {
+            existing.off();
+            existing.remove();
+          } catch (_) {}
+          mapInstanceRef.current = null;
+        }
         const map = L.map(overlay, { attributionControl: false, zoomControl: false }).setView(
           [mapCenter!.lat, mapCenter!.lon],
           12
@@ -649,17 +742,18 @@ export default function EarthScene({
           setLocationText("Адрес не определён");
         }
       });
-      return () => {
-        const m = mapInstanceRef.current;
-        if (m) {
-          try {
-            m.off();
-            m.remove();
-          } catch (_) {}
-          mapInstanceRef.current = null;
-        }
-      };
     });
+    return () => {
+      cancelled = true;
+      const m = mapInstanceRef.current;
+      if (m) {
+        try {
+          m.off();
+          m.remove();
+        } catch (_) {}
+        mapInstanceRef.current = null;
+      }
+    };
   }, [showMapOverlay, mapCenter, returnToGlobe]);
 
   useEffect(() => {
@@ -675,26 +769,34 @@ export default function EarthScene({
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "ArrowUp") {
         e.preventDefault();
+        (document.activeElement as HTMLElement)?.blur();
         keysRef.current.up = true;
+        setPressedKeys({ ...keysRef.current });
       }
       if (e.key === "ArrowDown") {
         e.preventDefault();
+        (document.activeElement as HTMLElement)?.blur();
         keysRef.current.down = true;
+        setPressedKeys({ ...keysRef.current });
       }
       if (e.key === "ArrowLeft") {
         e.preventDefault();
+        (document.activeElement as HTMLElement)?.blur();
         keysRef.current.left = true;
+        setPressedKeys({ ...keysRef.current });
       }
       if (e.key === "ArrowRight") {
         e.preventDefault();
+        (document.activeElement as HTMLElement)?.blur();
         keysRef.current.right = true;
+        setPressedKeys({ ...keysRef.current });
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key === "ArrowUp") keysRef.current.up = false;
-      if (e.key === "ArrowDown") keysRef.current.down = false;
-      if (e.key === "ArrowLeft") keysRef.current.left = false;
-      if (e.key === "ArrowRight") keysRef.current.right = false;
+      if (e.key === "ArrowUp") { keysRef.current.up = false; setPressedKeys({ ...keysRef.current }); }
+      if (e.key === "ArrowDown") { keysRef.current.down = false; setPressedKeys({ ...keysRef.current }); }
+      if (e.key === "ArrowLeft") { keysRef.current.left = false; setPressedKeys({ ...keysRef.current }); }
+      if (e.key === "ArrowRight") { keysRef.current.right = false; setPressedKeys({ ...keysRef.current }); }
     };
     let rafId: number;
     const tick = () => {
@@ -722,39 +824,44 @@ export default function EarthScene({
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) return;
-    setSearchResult(null);
+    setSearchError(null);
+    setSearchResults([]);
+    if (showMapOverlay && !mapInstanceRef.current) {
+      setSearchError("Дождитесь загрузки карты");
+      return;
+    }
     try {
       const res = await fetch(
         `/api/geocode/search?q=${encodeURIComponent(searchQuery)}`
       );
       const data = await res.json();
-      if (Array.isArray(data) && data[0]) {
-        const { lat, lon, display_name } = data[0];
-        const latN = parseFloat(lat);
-        const lonN = parseFloat(lon);
-        setSearchResult(display_name || `${latN.toFixed(2)}, ${lonN.toFixed(2)}`);
-        mapInstanceRef.current?.setView([latN, lonN], 13);
-      } else setSearchResult("Не найдено");
+      if (!res.ok) {
+        setSearchError("Ошибка поиска");
+        return;
+      }
+      const items: SearchResultItem[] = [];
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          const lat = item.lat != null ? parseFloat(item.lat) : NaN;
+          const lon = item.lon != null ? parseFloat(item.lon) : (item.lng != null ? parseFloat(item.lng) : NaN);
+          if (!Number.isNaN(lat) && !Number.isNaN(lon)) {
+            items.push({ lat, lon, display_name: item.display_name || `${lat.toFixed(2)}, ${lon.toFixed(2)}` });
+          }
+        }
+      }
+      setSearchResults(items);
+      setSearchResultPage(0);
+      if (items.length === 0) setSearchError("Не найдено");
     } catch {
-      setSearchResult("Ошибка поиска");
+      setSearchError("Ошибка поиска");
     }
   };
 
-  const uiLayerStyle: React.CSSProperties = {
-    position: "fixed",
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    width: "100%",
-    height: "100%",
-    minHeight: "100vh",
-    zIndex: 2147483647,
-    pointerEvents: "none",
-    overflow: "visible",
-    visibility: "visible",
-    display: "block",
+  const selectSearchResult = (item: SearchResultItem) => {
+    mapInstanceRef.current?.setView([item.lat, item.lon], 13);
+    setSearchResults([]);
   };
+
   const panelStyle: React.CSSProperties = {
     pointerEvents: "auto",
     background: "#1e293b",
@@ -767,8 +874,6 @@ export default function EarthScene({
     minWidth: 0,
   };
 
-  const layerBase = { ...uiLayerStyle };
-
   const globePanels = (
     <>
       <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", top: 16, right: 16, maxWidth: "calc(100vw - 32px)", zIndex: 2, visibility: "visible", display: "block" }}>
@@ -778,88 +883,129 @@ export default function EarthScene({
         <button type="button" onClick={() => onAutoRotateChange?.(!autoRotate)} style={{ padding: "10px 16px", background: autoRotate ? "#16a34a" : "#475569", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 14 }}>
           {autoRotate ? "Стоп" : "Вращение"}
         </button>
-        <button type="button" onClick={() => apiRef.current?.zoomIn()} style={{ padding: "10px 16px", background: "#475569", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 16 }}>+</button>
         <button type="button" onClick={() => apiRef.current?.zoomOut()} style={{ padding: "10px 16px", background: "#475569", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 16 }}>−</button>
+        <button type="button" onClick={() => apiRef.current?.zoomIn()} style={{ padding: "10px 16px", background: "#475569", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 16 }}>+</button>
+        <button type="button" onClick={() => transitionTo2DRef.current?.()} style={{ padding: "10px 16px", background: "#2563eb", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 14 }}>
+          На карту
+        </button>
       </div>
     </>
   );
+
+  const zoomToGlobe = Math.max(0, mapZoom - MIN_ZOOM_GLOBE);
+  const pluralOtdalenie = (n: number) => {
+    const mod10 = n % 10, mod100 = n % 100;
+    if (mod100 >= 11 && mod100 <= 19) return "отдалений";
+    if (mod10 === 1) return "отдаление";
+    if (mod10 >= 2 && mod10 <= 4) return "отдаления";
+    return "отдалений";
+  };
+
+  const RESULTS_PER_PAGE = 3;
+  const searchResultMaxPage = Math.max(0, Math.ceil(searchResults.length / RESULTS_PER_PAGE) - 1);
+  const searchResultSlice = searchResults.slice(searchResultPage * RESULTS_PER_PAGE, searchResultPage * RESULTS_PER_PAGE + RESULTS_PER_PAGE);
 
   const map2dPanels = (
     <>
-      <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", top: 12, left: 12, right: 12, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", maxWidth: "min(520px, calc(100vw - 24px))" }}>
-        <input
-          type="text"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-          placeholder="Город…"
-          style={{ padding: "8px 12px", width: 140, borderRadius: 8, border: "2px solid #334155", fontSize: 14, background: "#fff", color: "#111" }}
-        />
-        <button type="button" onClick={handleSearch} style={{ padding: "8px 14px", background: "#16a34a", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 600 }}>
-          Найти
-        </button>
+      <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", top: 16, right: 16, maxWidth: "calc(100vw - 32px)", zIndex: 2, visibility: "visible", display: "block" }}>
+        {authBlock}
+      </div>
+      <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", top: 12, left: 12, display: "flex", flexDirection: "column", gap: 4, maxWidth: "min(400px, calc(100vw - 120px))" }}>
+        <span style={{ fontSize: 11, color: "#94a3b8" }}>Текущее местоположение</span>
         <span style={{ fontSize: 12, background: "rgba(0,0,0,0.3)", padding: "4px 10px", borderRadius: 6 }}>{locationText}</span>
       </div>
-      <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", bottom: 20, left: 20, display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center", maxWidth: "calc(100vw - 180px)" }}>
+      <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", top: 100, left: 12, display: "flex", flexDirection: "column", gap: 8, maxWidth: "min(400px, calc(100vw - 120px))" }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+            placeholder="Город…"
+            style={{ padding: "8px 12px", width: 140, borderRadius: 8, border: "2px solid #334155", fontSize: 14, background: "#fff", color: "#111" }}
+          />
+          <button type="button" onClick={handleSearch} style={{ padding: "8px 14px", background: "#16a34a", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 600 }}>
+            Найти
+          </button>
+        </div>
+        {searchError && <span style={{ fontSize: 12, color: "#f87171" }}>{searchError}</span>}
+        {searchResults.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 11, color: "#94a3b8" }}>Выберите место:</span>
+            {searchResultSlice.map((item, i) => (
+              <button
+                key={`${item.lat}-${item.lon}-${i}`}
+                type="button"
+                onClick={() => selectSearchResult(item)}
+                style={{ textAlign: "left", padding: "8px 10px", borderRadius: 8, border: "1px solid #475569", background: "rgba(0,0,0,0.2)", color: "#fff", cursor: "pointer", fontSize: 12 }}
+              >
+                {item.display_name}
+              </button>
+            ))}
+            {searchResultMaxPage > 0 && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <button type="button" onClick={() => setSearchResultPage((p) => Math.max(0, p - 1))} style={{ padding: "4px 10px", borderRadius: 6, border: "none", background: "#475569", color: "#fff", cursor: "pointer", fontSize: 12 }}>‹</button>
+                <input
+                  type="range"
+                  min={0}
+                  max={searchResultMaxPage}
+                  value={searchResultPage}
+                  onChange={(e) => setSearchResultPage(parseInt(e.target.value, 10))}
+                  style={{ flex: 1, minWidth: 60 }}
+                />
+                <button type="button" onClick={() => setSearchResultPage((p) => Math.min(searchResultMaxPage, p + 1))} style={{ padding: "4px 10px", borderRadius: 6, border: "none", background: "#475569", color: "#fff", cursor: "pointer", fontSize: 12 }}>›</button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", bottom: 20, left: 20 }}>
         <button type="button" onClick={returnToGlobe} style={{ padding: "10px 16px", background: "#1e40af", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600 }}>
           На глобус
         </button>
-        <span style={{ fontSize: 13 }}>Масштаб {mapZoom}. До перехода на глобус: ещё {Math.max(0, mapZoom - 11)} отдалений.</span>
+      </div>
+      <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", bottom: 20, left: 170, display: "flex", flexDirection: "column", gap: 4, maxWidth: "min(240px, calc(100vw - 420px))" }}>
+        <span style={{ fontSize: 11, color: "#94a3b8" }}>Масштаб до перехода на глобус</span>
+        <span style={{ fontSize: 13 }}>Масштаб {mapZoom}. Ещё {zoomToGlobe} {pluralOtdalenie(zoomToGlobe)}.</span>
+      </div>
+      <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", bottom: 20, left: 430, display: "flex", gap: 6, alignItems: "center" }}>
+        <button type="button" onClick={() => mapInstanceRef.current?.zoomOut()} style={{ width: 36, height: 36, padding: 0, border: "none", borderRadius: 8, background: "#475569", color: "#fff", cursor: "pointer", fontSize: 18 }}>−</button>
+        <button type="button" onClick={() => mapInstanceRef.current?.zoomIn()} style={{ width: 36, height: 36, padding: 0, border: "none", borderRadius: 8, background: "#475569", color: "#fff", cursor: "pointer", fontSize: 18 }}>+</button>
       </div>
       <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", bottom: 20, right: 20, padding: "10px" }}>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 40px 1fr", gridTemplateRows: "40px 40px 40px", gap: 4, alignItems: "center", justifyItems: "center" }}>
-          <div />
-          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 18, touchAction: "none" }} onPointerDown={() => { keysRef.current.up = true; }} onPointerUp={() => { keysRef.current.up = false; }} onPointerCancel={() => { keysRef.current.up = false; }}>↑</button>
-          <div />
-          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 18, touchAction: "none" }} onPointerDown={() => { keysRef.current.left = true; }} onPointerUp={() => { keysRef.current.left = false; }} onPointerCancel={() => { keysRef.current.left = false; }}>←</button>
+        <div style={{ display: "grid", gridTemplateColumns: "40px 40px 40px", gridTemplateRows: "40px 40px 40px", gap: 4, alignItems: "center", justifyItems: "center" }}>
+          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: pressedKeys.up && pressedKeys.left ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 16, touchAction: "none" }} onPointerDown={() => { keysRef.current.up = true; keysRef.current.left = true; setPressedKeys({ ...keysRef.current }); }} onPointerUp={() => { keysRef.current.up = false; keysRef.current.left = false; setPressedKeys({ ...keysRef.current }); }} onPointerCancel={() => { keysRef.current.up = false; keysRef.current.left = false; setPressedKeys({ ...keysRef.current }); }}>↖</button>
+          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: pressedKeys.up ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 18, touchAction: "none" }} onPointerDown={() => { keysRef.current.up = true; setPressedKeys({ ...keysRef.current }); }} onPointerUp={() => { keysRef.current.up = false; setPressedKeys({ ...keysRef.current }); }} onPointerCancel={() => { keysRef.current.up = false; setPressedKeys({ ...keysRef.current }); }}>↑</button>
+          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: pressedKeys.up && pressedKeys.right ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 16, touchAction: "none" }} onPointerDown={() => { keysRef.current.up = true; keysRef.current.right = true; setPressedKeys({ ...keysRef.current }); }} onPointerUp={() => { keysRef.current.up = false; keysRef.current.right = false; setPressedKeys({ ...keysRef.current }); }} onPointerCancel={() => { keysRef.current.up = false; keysRef.current.right = false; setPressedKeys({ ...keysRef.current }); }}>↗</button>
+          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: pressedKeys.left ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 18, touchAction: "none" }} onPointerDown={() => { keysRef.current.left = true; setPressedKeys({ ...keysRef.current }); }} onPointerUp={() => { keysRef.current.left = false; setPressedKeys({ ...keysRef.current }); }} onPointerCancel={() => { keysRef.current.left = false; setPressedKeys({ ...keysRef.current }); }}>←</button>
           <div style={{ width: 40, height: 40 }} />
-          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 18, touchAction: "none" }} onPointerDown={() => { keysRef.current.right = true; }} onPointerUp={() => { keysRef.current.right = false; }} onPointerCancel={() => { keysRef.current.right = false; }}>→</button>
-          <div />
-          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 18, touchAction: "none" }} onPointerDown={() => { keysRef.current.down = true; }} onPointerUp={() => { keysRef.current.down = false; }} onPointerCancel={() => { keysRef.current.down = false; }}>↓</button>
-          <div />
+          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: pressedKeys.right ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 18, touchAction: "none" }} onPointerDown={() => { keysRef.current.right = true; setPressedKeys({ ...keysRef.current }); }} onPointerUp={() => { keysRef.current.right = false; setPressedKeys({ ...keysRef.current }); }} onPointerCancel={() => { keysRef.current.right = false; setPressedKeys({ ...keysRef.current }); }}>→</button>
+          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: pressedKeys.down && pressedKeys.left ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 16, touchAction: "none" }} onPointerDown={() => { keysRef.current.down = true; keysRef.current.left = true; setPressedKeys({ ...keysRef.current }); }} onPointerUp={() => { keysRef.current.down = false; keysRef.current.left = false; setPressedKeys({ ...keysRef.current }); }} onPointerCancel={() => { keysRef.current.down = false; keysRef.current.left = false; setPressedKeys({ ...keysRef.current }); }}>↙</button>
+          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: pressedKeys.down ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 18, touchAction: "none" }} onPointerDown={() => { keysRef.current.down = true; setPressedKeys({ ...keysRef.current }); }} onPointerUp={() => { keysRef.current.down = false; setPressedKeys({ ...keysRef.current }); }} onPointerCancel={() => { keysRef.current.down = false; setPressedKeys({ ...keysRef.current }); }}>↓</button>
+          <button type="button" style={{ width: 40, height: 40, padding: 0, border: "none", borderRadius: 8, background: pressedKeys.down && pressedKeys.right ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer", fontSize: 16, touchAction: "none" }} onPointerDown={() => { keysRef.current.down = true; keysRef.current.right = true; setPressedKeys({ ...keysRef.current }); }} onPointerUp={() => { keysRef.current.down = false; keysRef.current.right = false; setPressedKeys({ ...keysRef.current }); }} onPointerCancel={() => { keysRef.current.down = false; keysRef.current.right = false; setPressedKeys({ ...keysRef.current }); }}>↘</button>
         </div>
       </div>
-      {searchResult && (
-        <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", top: 130, left: 16, right: 16, maxWidth: "calc(100vw - 32px)", color: "#e2e8f0" }}>
-          {searchResult}
-        </div>
-      )}
     </>
   );
 
+  // Одна обёртка с pointerEvents "none": клики проходят к канвасу (глобус) или к карте (2D). Панели с pointerEvents "auto".
   const uiContent = (
-    <div className="z96a-ui-layer" style={layerBase}>
-      <div
-        data-ui-branch="globe"
-        style={{
-          display: "block",
-          visibility: showMapOverlay ? "hidden" : "visible",
-          position: "absolute",
-          inset: 0,
-          pointerEvents: "none",
-          zIndex: showMapOverlay ? 0 : 2,
-        }}
-      >
-        {globePanels}
-      </div>
-      <div
-        data-ui-branch="2d"
-        style={{
-          display: "block",
-          visibility: showMapOverlay ? "visible" : "hidden",
-          position: "absolute",
-          inset: 0,
-          pointerEvents: "none",
-          zIndex: showMapOverlay ? 2 : 0,
-        }}
-      >
-        {map2dPanels}
-      </div>
+    <div
+      className="z96a-ui-root-content"
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 1000,
+        pointerEvents: "none",
+      }}
+    >
+      {/* При старте showMapOverlay === false → всегда рендерится globePanels, пустой ветки нет */}
+      {!showMapOverlay ? globePanels : map2dPanels}
     </div>
   );
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%", minHeight: "100vh" }}>
+    <div style={{ position: "relative", width: "100vw", height: "100vh" }}>
       <div style={{ position: "absolute", inset: 0, overflow: "hidden", zIndex: 0 }}>
         <div
           ref={containerRef}
@@ -870,6 +1016,7 @@ export default function EarthScene({
             width: "100%",
             height: "100%",
             zIndex: 0,
+            pointerEvents: "none",
           }}
         />
         <div
@@ -883,8 +1030,8 @@ export default function EarthScene({
           }}
         />
         {showMapOverlay && (
-          <div style={{ position: "absolute", inset: 0, zIndex: 10, width: "100%", height: "100%" }}>
-            <div ref={overlayRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", zIndex: 1 }} />
+          <div style={{ position: "absolute", inset: 0, zIndex: 10, width: "100%", height: "100%", pointerEvents: "auto" }}>
+            <div ref={overlayRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", zIndex: 1, pointerEvents: "auto" }} />
           </div>
         )}
       </div>
@@ -894,14 +1041,11 @@ export default function EarthScene({
         role="presentation"
         style={{
           position: "fixed",
-          top: 0,
           left: 0,
-          right: 0,
-          bottom: 0,
-          width: "100%",
-          height: "100%",
-          minHeight: "100vh",
-          zIndex: 2147483647,
+          top: 0,
+          width: "100vw",
+          height: "100vh",
+          zIndex: 1000,
           pointerEvents: "none",
           display: "block",
           visibility: "visible",

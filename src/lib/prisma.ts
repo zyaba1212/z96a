@@ -1,3 +1,6 @@
+/**
+ * Singleton Prisma Client для Next.js (избегаем множественных инстансов при hot reload).
+ */
 import { PrismaClient } from "@prisma/client";
 
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };

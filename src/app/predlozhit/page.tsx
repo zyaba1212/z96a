@@ -1,5 +1,9 @@
 "use client";
 
+/**
+ * Страница «Предложить» (маршрут /predlozhit).
+ * Заглушка до этапа 5 — режим редактирования сети.
+ */
 import Link from "next/link";
 
 export default function PredlozhitPage() {

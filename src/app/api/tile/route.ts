@@ -1,3 +1,8 @@
+/**
+ * API-прокси тайлов карты: GET /api/tile?z=&x=&y=&source=
+ * source=osm — только OSM; иначе сначала ESRI, при ошибке fallback на OSM.
+ * Возвращает бинарный PNG с кэшированием.
+ */
 import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";

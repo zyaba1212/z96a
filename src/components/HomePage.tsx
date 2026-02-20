@@ -1,5 +1,9 @@
 "use client";
 
+/**
+ * Главная страница: глобус + 2D-карта (EarthScene), авторизация (AuthBlock).
+ * Управление авто-вращением и передача API глобуса для зума/панорамирования с клавиатуры.
+ */
 import { useState, useRef, useCallback, useEffect } from "react";
 import EarthScene, { type GlobeControls } from "./EarthScene";
 import AuthBlock from "./AuthBlock";

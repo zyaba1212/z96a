@@ -1,3 +1,7 @@
+/**
+ * Корневой layout приложения z96a.
+ * Задаёт метаданные, язык и оборачивает всё в провайдеры (Solana wallet).
+ */
 import type { Metadata } from "next";
 import { Providers } from "./providers";
 import "./globals.css";
