@@ -2,6 +2,12 @@
 
 Данные о сети должны браться из **официальных источников** где возможно.
 
+## Реализованные интеграции
+
+- **Кабели:** `npm run sync:cables` — запрос к ArcGIS FeatureServer (TeleGeography) или загрузка из `scripts/data/submarine-cables.geojson`. Запись в БД с `sourceId` для дедупликации.
+- **Спутники:** `npm run sync:satellites` — загрузка TLE с CelesTrak (GROUP=active), расчёт позиций через satellite.js, запись SATELLITE с lat/lng/altitude и sourceId=norad_*.
+- **API:** GET `/api/network?scope=GLOBAL|LOCAL`; для LOCAL опционально `bbox=minLat,minLng,maxLat,maxLng` (фильтр по точке).
+
 ## Глобальная сеть (глобус и 2D)
 
 - **Подводные кабели:** [TeleGeography Submarine Cable Map](https://www.telegeography.com/submarine-cable-map) — открытые данные о магистралях.

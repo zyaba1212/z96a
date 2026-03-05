@@ -32,11 +32,16 @@ model NetworkElement {
   providerId  String?
   provider    NetworkProvider? @relation(fields: [providerId], references: [id])
   name        String?
-  // Точка (БС, спутник, оборудование): lat/lng заданы, path пустой.
+  // Внешний идентификатор источника (для дедупликации при автообновлении).
+  sourceId    String?         @unique
+  // Точка (БС, спутник, оборудование): lat/lng заданы, path пустой. Для спутников — altitude в км.
   lat         Float?
   lng         Float?
+  altitude    Float?          // высота над поверхностью (км), для SATELLITE
   // Кабель: массив точек [{lat, lng}, ...] в JSON.
   path        Json?           // [{ "lat": number, "lng": number }, ...]
+  // Доп. метаданные (владелец, дата ввода, ссылка на источник).
+  metadata    Json?
   createdAt   DateTime       @default(now())
   updatedAt   DateTime       @updatedAt
 }

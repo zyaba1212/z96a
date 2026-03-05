@@ -8,10 +8,15 @@
 import { useRef, useEffect, useState, useCallback } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { Line2 } from "three/examples/jsm/lines/Line2.js";
+import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
+import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import "leaflet/dist/leaflet.css";
 
 /** Радиус сферы Земли в сцене */
 const R = 1;
+/** Радиус для вершин кабелей (чуть выше поверхности, чтобы избежать z-fighting) */
+const R_CABLE = R * 1.002;
 const MAP_THRESHOLD = 1.25;
 /** Гистерезис: переход глобус→2D только при минимальном расстоянии (зум колёсиком не сбрасывает кнопки) */
 const MAP_THRESHOLD_ENTER_2D = 1.2;
@@ -157,6 +162,17 @@ function latLngToXYZ(lat: number, lng: number): [number, number, number] {
   ];
 }
 
+/** Широта/долгота → координаты на сфере заданного радиуса (для кабелей — R_CABLE) */
+function latLngToXYZWithRadius(lat: number, lng: number, radius: number): [number, number, number] {
+  const phi = ((90 - lat) * Math.PI) / 180;
+  const theta = (lng * Math.PI) / 180;
+  return [
+    radius * Math.sin(phi) * Math.cos(theta),
+    radius * Math.cos(phi),
+    -radius * Math.sin(phi) * Math.sin(theta),
+  ];
+}
+
 /** Декартовы x,y,z на сфере → широта и долгота */
 function xyzToLatLon(x: number, y: number, z: number): { lat: number; lon: number } {
   const phi = Math.acos(Math.max(-1, Math.min(1, y / R)));
@@ -227,8 +243,12 @@ function addBorders(scene: THREE.Scene) {
 const CABLE_COPPER_COLOR = 0xe67e22;
 const CABLE_FIBER_COLOR = 0x22c55e;
 const NODE_COLOR = 0x3498db;
+/** Спутники — отдельный цвет для различимости */
+const SATELLITE_COLOR = 0x9b59b6;
 
 /** Типы элементов сети из API */
+/** Радиус Земли в км (для размещения спутников по altitude). */
+const EARTH_RADIUS_KM = 6371;
 type NetworkElementApi = {
   id: string;
   scope: string;
@@ -236,40 +256,164 @@ type NetworkElementApi = {
   name: string | null;
   lat: number | null;
   lng: number | null;
+  altitude?: number | null;
   path: Array<{ lat: number; lng: number }> | null;
 };
 
-/** Загружает /api/network?scope=GLOBAL и отрисовывает кабели (линии) и узлы (малые сферы) на глобусе. */
-function addNetworkLayer(scene: THREE.Scene) {
+/** Загружает /api/network?scope=GLOBAL и отрисовывает кабели (линии) и узлы (малые сферы) на глобусе. sceneRef — текущая сцена (группа добавляется в sceneRef.current при готовности). resolution — размер viewport для LineMaterial. containerRef — опционально, для актуального resolution при добавлении группы. cancelledRef — при true не добавлять группу в сцену. runIdRef/runId — только этот run добавляет группу (Strict Mode). */
+function addNetworkLayer(
+  sceneRef: { current: THREE.Scene | null },
+  resolution?: THREE.Vector2,
+  containerRef?: { current: HTMLDivElement | null },
+  cancelledRef?: { current: boolean },
+  runIdRef?: { current: number },
+  runId?: number
+) {
   const group = new THREE.Group();
   group.name = "network";
+  group.renderOrder = 1;
+  const res = resolution?.clone() ?? new THREE.Vector2(1, 1);
   fetch("/api/network?scope=GLOBAL")
-    .then((r) => r.json())
-    .then((data: { elements?: NetworkElementApi[] }) => {
+    .then((r) => {
+      if (!r.ok) {
+        console.warn("[network] API status:", r.status);
+        return r.json().catch(() => ({}));
+      }
+      return r.json();
+    })
+    .then((data: { elements?: NetworkElementApi[]; error?: string }) => {
+      if (data.error) {
+        console.warn("[network] API error:", data.error);
+        return;
+      }
       const elements = data.elements ?? [];
+      console.log("[network] GLOBAL elements:", elements.length, elements.map((e) => ({ type: e.type, name: e.name })));
+      const safeRes =
+        res.x > 0 && res.y > 0
+          ? res.clone()
+          : typeof window !== "undefined"
+            ? new THREE.Vector2(window.innerWidth, window.innerHeight)
+            : new THREE.Vector2(1920, 1080);
+      if (safeRes.x <= 0 || safeRes.y <= 0) safeRes.set(1920, 1080);
+      if (cancelledRef?.current) {
+        console.log("[network] addNetworkLayer cancelled (unmounted).");
+        return;
+      }
+      if (runIdRef != null && runId !== undefined && runIdRef.current !== runId) {
+        console.log("[network] addNetworkLayer skipped (stale run).");
+        return;
+      }
+      let addedLines = 0;
+      let addedNodes = 0;
       elements.forEach((el) => {
-        if (el.path && Array.isArray(el.path) && el.path.length >= 2) {
+        const pathArr = Array.isArray(el.path)
+          ? el.path
+          : typeof el.path === "string"
+            ? (() => {
+                try {
+                  return JSON.parse(el.path) as Array<{ lat: number; lng: number }>;
+                } catch {
+                  return [];
+                }
+              })()
+            : el.path && typeof el.path === "object"
+              ? (Object.values(el.path) as Array<{ lat: number; lng: number }>)
+              : [];
+        if (pathArr.length >= 2) {
           const color =
             el.type === "CABLE_FIBER" ? CABLE_FIBER_COLOR : CABLE_COPPER_COLOR;
-          const pts = el.path.map((p) => new THREE.Vector3(...latLngToXYZ(p.lat, p.lng)));
-          const line = new THREE.Line(
-            new THREE.BufferGeometry().setFromPoints(pts),
-            new THREE.LineBasicMaterial({ color, linewidth: 1 })
-          );
+          const positions: number[] = [];
+          pathArr.forEach((p) => {
+            const lat = Number((p as { lat?: unknown }).lat);
+            const lng = Number((p as { lng?: unknown }).lng);
+            if (Number.isNaN(lat) || Number.isNaN(lng)) return;
+            const [x, y, z] = latLngToXYZWithRadius(lat, lng, R_CABLE);
+            positions.push(x, y, z);
+          });
+          if (positions.length < 6) {
+            console.warn("[network] skip cable: not enough valid points", el.type, el.name, "pathArr:", pathArr.length, "positions:", positions.length);
+            return;
+          }
+          console.log("[network] cable:", el.type, el.name, "points:", pathArr.length, "positions:", positions.length);
+          const geometry = new LineGeometry().setPositions(positions);
+          const material = new LineMaterial({
+            color,
+            linewidth: 5,
+            worldUnits: false,
+            resolution: safeRes.clone(),
+            depthTest: true,
+            depthWrite: true,
+          });
+          const line = new Line2(geometry, material);
           group.add(line);
+          addedLines++;
         } else if (el.lat != null && el.lng != null) {
-          const [x, y, z] = latLngToXYZ(el.lat, el.lng);
+          const rawLat = el.lat;
+          const rawLng = el.lng;
+          const lat = Number(rawLat);
+          const lng = Number(rawLng);
+          if (Number.isNaN(lat) || Number.isNaN(lng)) {
+            console.warn("[network] skip element invalid lat/lng:", el.id, el.type, "raw lat:", rawLat, "raw lng:", rawLng);
+            return;
+          }
+          const radius = Math.max(
+            R,
+            el.altitude != null && Number(el.altitude) > 0
+              ? R + Number(el.altitude) / EARTH_RADIUS_KM
+              : R
+          );
+          const [x, y, z] = latLngToXYZWithRadius(lat, lng, radius);
+          const isSatellite = el.type === "SATELLITE";
+          const nodeColor = isSatellite ? SATELLITE_COLOR : NODE_COLOR;
           const mesh = new THREE.Mesh(
-            new THREE.SphereGeometry(0.012, 8, 6),
-            new THREE.MeshBasicMaterial({ color: NODE_COLOR })
+            new THREE.SphereGeometry(isSatellite ? 0.022 : 0.015, 8, 6),
+            new THREE.MeshBasicMaterial({ color: nodeColor })
           );
           mesh.position.set(x, y, z);
+          mesh.userData = { networkElement: el };
           group.add(mesh);
+          addedNodes++;
+          console.log("[network] node:", el.type, el.name, "lat:", lat, "lng:", lng, "radius:", radius);
+        } else {
+          console.log("[network] skip element (no path, no lat/lng):", el.type, el.name);
         }
       });
-      scene.add(group);
+      if (cancelledRef?.current) {
+        console.log("[network] addNetworkLayer cancelled before scene.add.");
+        return;
+      }
+      if (runIdRef != null && runId !== undefined && runIdRef.current !== runId) {
+        console.log("[network] addNetworkLayer skipped (stale run) before scene.add.");
+        return;
+      }
+      const targetScene = sceneRef.current;
+      if (!targetScene) {
+        console.warn("[network] addNetworkLayer: no current scene (unmounted), skip adding group.");
+        return;
+      }
+      const container = containerRef?.current;
+      const rw = container && container.clientWidth > 0 && container.clientHeight > 0 ? container.clientWidth : safeRes.x;
+      const rh = container && container.clientWidth > 0 && container.clientHeight > 0 ? container.clientHeight : safeRes.y;
+      const resolutionVec = new THREE.Vector2(rw, rh);
+      console.log("[network] adding group to scene, lines:", addedLines, "nodes:", addedNodes, "resolution:", resolutionVec.x, resolutionVec.y);
+      targetScene.add(group);
+      let lineCount = 0;
+      group.children.forEach((c) => {
+        if ((c as { isLine2?: boolean }).isLine2) {
+          const line2 = c as Line2;
+          const mat = line2.material as InstanceType<typeof LineMaterial>;
+          if (mat && "resolution" in mat && mat.resolution) {
+            mat.resolution.copy(resolutionVec);
+            lineCount++;
+          }
+        }
+      });
+      if (lineCount > 0) console.log("[network] resolution set for", lineCount, "Line2");
+      window.dispatchEvent(new Event("resize"));
     })
-    .catch(() => {});
+    .catch((err) => {
+      console.warn("[network] fetch failed:", err);
+    });
   return group;
 }
 
@@ -372,14 +516,37 @@ export default function EarthScene({
   const controlsRef = useRef<OrbitControls | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
   const mapInstanceRef = useRef<ReturnType<typeof import("leaflet").map> | null>(null);
+  const destroyingMapRef = useRef(false);
   const overlayShownRef = useRef(false);
+  const transitionTo2DScheduledRef = useRef(false);
+
+  const isMapContainerInDoc = useCallback((map: ReturnType<typeof import("leaflet").map> | null) => {
+    if (!map) return false;
+    const container = map.getContainer?.();
+    return !!(container?.parentNode && typeof document !== "undefined" && document.body.contains(container));
+  }, []);
+
+  const safeMapCall = useCallback(<T,>(map: ReturnType<typeof import("leaflet").map> | null, fn: (m: NonNullable<ReturnType<typeof import("leaflet").map>>) => T): T | undefined => {
+    if (!map || !isMapContainerInDoc(map)) return undefined;
+    try {
+      return fn(map);
+    } catch {
+      return undefined;
+    }
+  }, [isMapContainerInDoc]);
   const transitionTo2DRef = useRef<(() => void) | null>(null);
   const lastDistOver6Ref = useRef(false);
   const setShowGoToMapButtonRef = useRef<((v: boolean) => void) | null>(null);
 
   const [showMapOverlay, setShowMapOverlay] = useState(false);
   const [showGoToMapButton, setShowGoToMapButton] = useState(false);
+  /** Текущее расстояние камеры до центра глобуса (для подсказки «до 2D»), обновляется с throttle */
+  const [distanceTo2D, setDistanceTo2D] = useState<number | null>(null);
+  const lastDistUpdateRef = useRef({ t: 0, dist: 0 });
+  const networkCancelledRef = useRef(false);
+  const networkRunIdRef = useRef(0);
   const [mapCenter, setMapCenter] = useState<MapCenter | null>(null);
   const [locationText, setLocationText] = useState<string>("Загрузка…");
   const [searchQuery, setSearchQuery] = useState("");
@@ -422,6 +589,7 @@ export default function EarthScene({
   }, [showMapOverlay]);
 
   const returnToGlobe = useCallback(() => {
+    if (destroyingMapRef.current) return;
     const map = mapInstanceRef.current;
     const controls = controlsRef.current;
     const camera = cameraRef.current;
@@ -431,9 +599,13 @@ export default function EarthScene({
       setMapCenter(null);
       return;
     }
-    const center = map.getCenter();
-    const lat = center.lat;
-    const lon = center.lng;
+    destroyingMapRef.current = true;
+    try {
+      (map as { scrollWheelZoom?: { disable?: () => void } }).scrollWheelZoom?.disable?.();
+    } catch (_) {}
+    const center = safeMapCall(map, (m) => m.getCenter());
+    const lat = center?.lat ?? 0;
+    const lon = center?.lng ?? 0;
     const [tx, ty, tz] = latLngToXYZ(lat, lon);
     const dir = new THREE.Vector3(tx, ty, tz).normalize();
     const dist = 3;
@@ -449,31 +621,46 @@ export default function EarthScene({
     newControls.target.set(0, 0, 0);
     newControls.update();
     controlsRef.current = newControls;
-    try {
-      map.off();
-      map.remove();
-    } catch (_) {}
+    map.off();
     mapInstanceRef.current = null;
+    // Отложить remove, чтобы Leaflet _onZoomTransitionEnd успел выполниться (иначе _leaflet_pos)
+    setTimeout(() => {
+      try {
+        const container = map.getContainer?.();
+        if (container?.parentNode && typeof document !== "undefined" && document.body.contains(container)) {
+          map.remove();
+        }
+      } catch (_) {}
+    }, 400);
     overlayShownRef.current = false;
+    transitionTo2DScheduledRef.current = false;
     lastDistOver6Ref.current = false;
     setShowGoToMapButton(false);
     requestAnimationFrame(() => {
-      setShowMapOverlay(false);
-      setMapCenter(null);
+      requestAnimationFrame(() => {
+        setShowMapOverlay(false);
+        setMapCenter(null);
+        destroyingMapRef.current = false;
+      });
     });
-  }, []);
+  }, [safeMapCall]);
 
   /** Инициализация Three.js: сцена, камера, рендерер, OrbitControls, Земля, границы, подписи, звёзды; цикл animate и переход в 2D при приближении */
   useEffect(() => {
+    networkCancelledRef.current = false;
+    networkRunIdRef.current += 1;
+    const runId = networkRunIdRef.current;
     const container = containerRef.current;
     if (!container) return;
 
     const scene = new THREE.Scene();
+    sceneRef.current = scene;
     scene.background = new THREE.Color(0x000814);
     const w = container.clientWidth;
     const h = container.clientHeight;
     const aspect = w > 0 && h > 0 ? w / h : 1;
     const camera = new THREE.PerspectiveCamera(50, aspect, 0.1, 1000);
+    // Дистанция 7 при R=1 — узлы (0.015/0.022) и кабели видны в кадре
     camera.position.set(0, 0, 7);
     camera.lookAt(0, 0, 0);
     camera.updateProjectionMatrix();
@@ -598,7 +785,7 @@ export default function EarthScene({
         );
         scene.add(earth);
         addBorders(scene);
-        addNetworkLayer(scene);
+        addNetworkLayer(sceneRef, new THREE.Vector2(container.clientWidth, container.clientHeight), containerRef, networkCancelledRef, networkRunIdRef, runId);
         requestAnimationFrame(() => {
           addLabels(labelsContainerRef.current, labelsRef);
         });
@@ -613,7 +800,7 @@ export default function EarthScene({
           )
         );
         addBorders(scene);
-        addNetworkLayer(scene);
+        addNetworkLayer(sceneRef, new THREE.Vector2(container.clientWidth, container.clientHeight), containerRef, networkCancelledRef, networkRunIdRef, runId);
         requestAnimationFrame(() => {
           addLabels(labelsContainerRef.current, labelsRef);
         });
@@ -629,12 +816,26 @@ export default function EarthScene({
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      scene.traverse((obj) => {
+        if (obj.name === "network" && obj instanceof THREE.Group) {
+          obj.children.forEach((c) => {
+            if ((c as { isLine2?: boolean }).isLine2) {
+              const line2 = c as Line2;
+              const mat = line2.material as InstanceType<typeof LineMaterial>;
+              if (mat && "resolution" in mat && mat.resolution) mat.resolution.set(w, h);
+            }
+          });
+        }
+      });
     };
     window.addEventListener("resize", onResize);
     onResize();
 
+    const RESIZE_DEBOUNCE_MS = 60;
+    let resizeTimeoutId: ReturnType<typeof setTimeout>;
     const resizeObserver = new ResizeObserver(() => {
-      onResize();
+      clearTimeout(resizeTimeoutId);
+      resizeTimeoutId = setTimeout(() => onResize(), RESIZE_DEBOUNCE_MS);
     });
     resizeObserver.observe(container);
 
@@ -652,8 +853,16 @@ export default function EarthScene({
             lastDistOver6Ref.current = over6;
             setShowGoToMapButtonRef.current?.(over6);
           }
+          const now = Date.now();
+          const last = lastDistUpdateRef.current;
+          if (now - last.t >= 100 || Math.abs(dist - last.dist) >= 0.15) {
+            lastDistUpdateRef.current = { t: now, dist };
+            setDistanceTo2D(dist);
+          }
         }
         if (dist <= MAP_THRESHOLD_ENTER_2D && !overlayShownRef.current) {
+          if (transitionTo2DScheduledRef.current) return;
+          transitionTo2DScheduledRef.current = true;
           const origin = camera.position.clone();
           const rayDir = ctrl.target
             .clone()
@@ -672,6 +881,8 @@ export default function EarthScene({
               overlayShownRef.current = true;
               setMapCenter({ lat, lon });
               setShowMapOverlay(true);
+              setDistanceTo2D(null);
+              transitionTo2DScheduledRef.current = false;
             });
           });
         }
@@ -714,16 +925,38 @@ export default function EarthScene({
     animate();
 
     return () => {
+      networkCancelledRef.current = true;
       transitionTo2DRef.current = null;
+      clearTimeout(resizeTimeoutId);
       resizeObserver.disconnect();
       window.removeEventListener("resize", onResize);
       cancelAnimationFrame(id);
-      mapInstanceRef.current?.remove();
+      destroyingMapRef.current = true;
+      const m = mapInstanceRef.current;
+      if (m) {
+        try {
+          m.off();
+        } catch (_) {}
+        mapInstanceRef.current = null;
+        try {
+          const container = m.getContainer?.();
+          if (container?.parentNode && typeof document !== "undefined" && document.body.contains(container)) {
+            m.remove();
+          }
+        } catch (_) {}
+      }
+      destroyingMapRef.current = false;
+      sceneRef.current = null;
       controls.dispose();
       scene.traverse((obj) => {
         if (obj.name === "network" && obj instanceof THREE.Group) {
           obj.children.forEach((c) => {
             if (c instanceof THREE.Line && c.geometry) c.geometry.dispose();
+            if ((c as { isLine2?: boolean }).isLine2) {
+              const line2 = c as Line2;
+              line2.geometry?.dispose();
+              if (line2.material) (Array.isArray(line2.material) ? line2.material : [line2.material]).forEach((m) => m.dispose());
+            }
             if (c instanceof THREE.Mesh) {
               c.geometry?.dispose();
               if (c.material) (Array.isArray(c.material) ? c.material : [c.material]).forEach((m) => m.dispose());
@@ -748,7 +981,7 @@ export default function EarthScene({
   useEffect(() => {
     if (!showMapOverlay || !mapCenter) return;
     const overlay = overlayRef.current;
-    if (!overlay || typeof window === "undefined") return;
+    if (!overlay || typeof window === "undefined" || !overlay.isConnected) return;
     let cancelled = false;
     let L: typeof import("leaflet");
     import("leaflet").then((leaflet) => {
@@ -759,11 +992,16 @@ export default function EarthScene({
         if (!overlay) return;
         const existing = mapInstanceRef.current;
         if (existing) {
+          destroyingMapRef.current = true;
           try {
             existing.off();
-            existing.remove();
+            const container = existing.getContainer?.();
+            if (container?.parentNode && typeof document !== "undefined" && document.body.contains(container)) {
+              existing.remove();
+            }
           } catch (_) {}
           mapInstanceRef.current = null;
+          destroyingMapRef.current = false;
         }
         const map = L.map(overlay, { attributionControl: false, zoomControl: false }).setView(
           [mapCenter!.lat, mapCenter!.lon],
@@ -772,8 +1010,11 @@ export default function EarthScene({
         L.tileLayer("/api/tile?z={z}&x={x}&y={y}&source=osm", {}).addTo(map);
         map.invalidateSize();
         mapInstanceRef.current = map;
+        destroyingMapRef.current = false;
         map.on("zoomend", () => {
+          if (destroyingMapRef.current) return;
           if (mapInstanceRef.current !== map) return;
+          if (!overlayRef.current || (typeof document !== "undefined" && !document.contains(overlayRef.current))) return;
           try {
             const z = map.getZoom();
             setMapZoom(z);
@@ -781,7 +1022,9 @@ export default function EarthScene({
           } catch (_) {}
         });
         map.on("moveend", () => {
+          if (destroyingMapRef.current) return;
           if (mapInstanceRef.current !== map) return;
+          if (!overlayRef.current || (typeof document !== "undefined" && !document.contains(overlayRef.current))) return;
           try {
             const c = map.getCenter();
             fetch(`/api/geocode/reverse?lat=${c.lat}&lng=${c.lng}`)
@@ -792,15 +1035,15 @@ export default function EarthScene({
               .catch(() => setLocationText("Адрес не определён"));
           } catch (_) {}
         });
-        try {
-          const c = map.getCenter();
-          fetch(`/api/geocode/reverse?lat=${c.lat}&lng=${c.lng}`)
+        const initialCenter = safeMapCall(map, (m) => m.getCenter());
+        if (initialCenter) {
+          fetch(`/api/geocode/reverse?lat=${initialCenter.lat}&lng=${initialCenter.lng}`)
             .then((r) => r.json())
             .then((data: { display_name?: string }) => {
               setLocationText(data?.display_name || "Адрес не определён");
             })
             .catch(() => setLocationText("Адрес не определён"));
-        } catch (_) {
+        } else {
           setLocationText("Адрес не определён");
         }
         // Сеть на 2D: глобальные кабели/узлы + локальные элементы (design.md: медь — оранжевый, оптика — зелёный)
@@ -809,20 +1052,22 @@ export default function EarthScene({
           .then((data: { elements?: NetworkElementApi[] }) => {
             if (mapInstanceRef.current !== map || cancelled) return;
             const elements = data.elements ?? [];
-            elements.forEach((el) => {
-              if (el.path && Array.isArray(el.path) && el.path.length >= 2) {
-                const latlngs = el.path.map((p) => [p.lat, p.lng] as [number, number]);
-                const color = el.type === "CABLE_FIBER" ? "#22c55e" : "#e67e22";
-                L.polyline(latlngs, { color, weight: 3 }).addTo(map);
-              } else if (el.lat != null && el.lng != null) {
-                L.circleMarker([el.lat, el.lng], {
-                  radius: 6,
-                  fillColor: "#3498db",
-                  color: "#fff",
-                  weight: 1,
-                  fillOpacity: 0.9,
-                }).addTo(map);
-              }
+            safeMapCall(map, (m) => {
+              elements.forEach((el) => {
+                if (el.path && Array.isArray(el.path) && el.path.length >= 2) {
+                  const latlngs = el.path.map((p) => [p.lat, p.lng] as [number, number]);
+                  const color = el.type === "CABLE_FIBER" ? "#22c55e" : "#e67e22";
+                  L.polyline(latlngs, { color, weight: 3 }).addTo(m);
+                } else if (el.lat != null && el.lng != null) {
+                  L.circleMarker([el.lat, el.lng], {
+                    radius: 6,
+                    fillColor: "#3498db",
+                    color: "#fff",
+                    weight: 1,
+                    fillOpacity: 0.9,
+                  }).addTo(m);
+                }
+              });
             });
           })
           .catch(() => {});
@@ -830,16 +1075,28 @@ export default function EarthScene({
     });
     return () => {
       cancelled = true;
+      destroyingMapRef.current = true;
       const m = mapInstanceRef.current;
       if (m) {
         try {
+          (m as { scrollWheelZoom?: { disable?: () => void } }).scrollWheelZoom?.disable?.();
+        } catch (_) {}
+        try {
           m.off();
-          m.remove();
         } catch (_) {}
         mapInstanceRef.current = null;
+        setTimeout(() => {
+          try {
+            const container = m.getContainer?.();
+            if (container?.parentNode && typeof document !== "undefined" && document.body.contains(container)) {
+              m.remove();
+            }
+          } catch (_) {}
+        }, 400);
       }
+      destroyingMapRef.current = false;
     };
-  }, [showMapOverlay, mapCenter, returnToGlobe]);
+  }, [showMapOverlay, mapCenter, returnToGlobe, safeMapCall]);
 
   useEffect(() => {
     if (showMapOverlay) return;
@@ -886,14 +1143,18 @@ export default function EarthScene({
     let rafId: number;
     const tick = () => {
       const map = mapInstanceRef.current;
-      if (map) {
+      if (map && isMapContainerInDoc(map)) {
         let dx = 0,
           dy = 0;
         if (keysRef.current.left) dx += PAN_STEP;
         if (keysRef.current.right) dx -= PAN_STEP;
         if (keysRef.current.up) dy += PAN_STEP;
         if (keysRef.current.down) dy -= PAN_STEP;
-        if (dx !== 0 || dy !== 0) map.panBy([-dx, -dy]);
+        if (dx !== 0 || dy !== 0) {
+          try {
+            map.panBy([-dx, -dy]);
+          } catch (_) {}
+        }
       }
       rafId = requestAnimationFrame(tick);
     };
@@ -905,7 +1166,7 @@ export default function EarthScene({
       window.removeEventListener("keyup", onKeyUp);
       cancelAnimationFrame(rafId);
     };
-  }, [showMapOverlay]);
+  }, [showMapOverlay, isMapContainerInDoc]);
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) return;
@@ -943,7 +1204,7 @@ export default function EarthScene({
   };
 
   const selectSearchResult = (item: SearchResultItem) => {
-    mapInstanceRef.current?.setView([item.lat, item.lon], 13);
+    safeMapCall(mapInstanceRef.current, (m) => m.setView([item.lat, item.lon], 13));
     setSearchResults([]);
   };
 
@@ -973,6 +1234,11 @@ export default function EarthScene({
         <button type="button" onClick={() => transitionTo2DRef.current?.()} style={{ padding: "10px 16px", background: "#2563eb", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 14 }}>
           На карту
         </button>
+        {!showMapOverlay && distanceTo2D != null && distanceTo2D > MAP_THRESHOLD_ENTER_2D && (
+          <span style={{ fontSize: 12, color: "#94a3b8", whiteSpace: "nowrap" }}>
+            До 2D: ~{Math.min(100, Math.round(((distanceTo2D - MAP_THRESHOLD_ENTER_2D) / (6 - MAP_THRESHOLD_ENTER_2D)) * 100))}% • ещё ~{Math.max(0, Math.ceil(Math.log(distanceTo2D / MAP_THRESHOLD_ENTER_2D) / Math.log(1.1)))} приближ.
+          </span>
+        )}
       </div>
     </>
   );
@@ -1054,8 +1320,8 @@ export default function EarthScene({
         <span style={{ fontSize: 13 }}>Масштаб {mapZoom}. Ещё {zoomToGlobe} {pluralOtdalenie(zoomToGlobe)}.</span>
       </div>
       <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", bottom: 20, left: 430, display: "flex", gap: 6, alignItems: "center" }}>
-        <button type="button" onClick={() => mapInstanceRef.current?.zoomOut()} style={{ width: 36, height: 36, padding: 0, border: "none", borderRadius: 8, background: "#475569", color: "#fff", cursor: "pointer", fontSize: 18 }}>−</button>
-        <button type="button" onClick={() => mapInstanceRef.current?.zoomIn()} style={{ width: 36, height: 36, padding: 0, border: "none", borderRadius: 8, background: "#475569", color: "#fff", cursor: "pointer", fontSize: 18 }}>+</button>
+        <button type="button" onClick={() => { if (showMapOverlay && mapInstanceRef.current && overlayRef.current && typeof document !== "undefined" && document.body.contains(overlayRef.current)) { try { mapInstanceRef.current.zoomOut(); } catch (_) {} } }} style={{ width: 36, height: 36, padding: 0, border: "none", borderRadius: 8, background: "#475569", color: "#fff", cursor: "pointer", fontSize: 18 }}>−</button>
+        <button type="button" onClick={() => { if (showMapOverlay && mapInstanceRef.current && overlayRef.current && typeof document !== "undefined" && document.body.contains(overlayRef.current)) { try { mapInstanceRef.current.zoomIn(); } catch (_) {} } }} style={{ width: 36, height: 36, padding: 0, border: "none", borderRadius: 8, background: "#475569", color: "#fff", cursor: "pointer", fontSize: 18 }}>+</button>
       </div>
       <div className="z96a-panel" style={{ ...panelStyle, position: "absolute", bottom: 20, right: 20, padding: "10px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "40px 40px 40px", gridTemplateRows: "40px 40px 40px", gap: 4, alignItems: "center", justifyItems: "center" }}>
@@ -1114,11 +1380,9 @@ export default function EarthScene({
             visibility: showMapOverlay ? "hidden" : "visible",
           }}
         />
-        {showMapOverlay && (
-          <div style={{ position: "absolute", inset: 0, zIndex: 10, width: "100%", height: "100%", pointerEvents: "auto" }}>
-            <div ref={overlayRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", zIndex: 1, pointerEvents: "auto" }} />
-          </div>
-        )}
+        <div style={{ position: "absolute", inset: 0, zIndex: 10, width: "100%", height: "100%", visibility: showMapOverlay ? "visible" : "hidden", pointerEvents: showMapOverlay ? "auto" : "none" }}>
+          <div ref={overlayRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", zIndex: 1, pointerEvents: "auto" }} />
+        </div>
       </div>
       <div
         id="z96a-ui-root"
