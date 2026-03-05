@@ -15,13 +15,17 @@ export async function GET(request: NextRequest) {
   const bbox = searchParams.get("bbox"); // "minLat,minLng,maxLat,maxLng" для LOCAL
 
   try {
-    const where: { scope?: string; lat?: { gte: number; lte: number }; lng?: { gte: number; lte: number } } =
-      scope === "GLOBAL" || scope === "LOCAL" ? { scope } : {};
+    type Where = { scope?: string; AND?: Array<Record<string, unknown>> };
+    const where: Where = scope === "GLOBAL" || scope === "LOCAL" ? { scope } : {};
     if (scope === "LOCAL" && bbox) {
       const [minLat, minLng, maxLat, maxLng] = bbox.split(",").map(Number);
       if ([minLat, minLng, maxLat, maxLng].every((n) => !Number.isNaN(n))) {
-        where.lat = { not: null, gte: minLat, lte: maxLat };
-        where.lng = { not: null, gte: minLng, lte: maxLng };
+        where.AND = [
+          { lat: { not: null } },
+          { lng: { not: null } },
+          { lat: { gte: minLat, lte: maxLat } },
+          { lng: { gte: minLng, lte: maxLng } },
+        ];
       }
     }
     const elements = await prisma.networkElement.findMany({
